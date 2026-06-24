@@ -346,6 +346,13 @@ class MultiModal(nn.Module):
                 # For MultiheadAttention, key_padding_mask is (B, S) with True=ignore
                 padding_notes_mask = ~notes_mask.bool()
 
+                # prevent all-masked rows from producing NaN in softmax
+                all_masked = padding_notes_mask.all(dim=1)  # (B,)
+                if all_masked.any():
+                    # valid_rows mask will later correctly zero out patients who had no real notes
+                    padding_notes_mask = padding_notes_mask.clone()
+                    padding_notes_mask[all_masked, 0] = False
+
             attn_mask = None
             has_valid_causal_note = None
             if timesteps is not None and notes_timesteps is not None:
@@ -367,6 +374,7 @@ class MultiModal(nn.Module):
                 key_padding_mask=padding_notes_mask,
                 is_causal=False # custom causal cross-attention mask is passed via attn_mask
             )
+            assert not torch.isnan(attn_output).any(), "NaN after notes fusion"
 
             if has_valid_causal_note is not None:
                 valid_rows = has_valid_causal_note.unsqueeze(-1).to(attn_output.dtype)
