@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+
+from config import CONFIG
 
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.preprocessing import StandardScaler
@@ -29,30 +32,6 @@ def compute_mutual_information_appr(x, y):
     return mi
 
 
-def build_elapsed_times(timesteps, mask=None):
-    """
-    Build elapsed times aligned to each timestep.
-
-    The first valid timestep has elapsed time 0. Subsequent valid timesteps get
-    the gap from the previous timestep. Padded positions are zeroed.
-    """
-    if timesteps.dim() != 2:
-        raise ValueError(f"timesteps must have shape (B, T), got {timesteps.shape}")
-
-    elapsed = torch.zeros_like(timesteps, dtype=torch.float32)
-    if timesteps.size(1) > 1:
-        elapsed[:, 1:] = timesteps[:, 1:].float() - timesteps[:, :-1].float()
-
-    elapsed = torch.nan_to_num(elapsed, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
-
-    if mask is not None:
-        if mask.shape != timesteps.shape:
-            raise ValueError(f"mask shape {mask.shape} does not match timesteps shape {timesteps.shape}")
-        elapsed = elapsed.masked_fill(~mask.bool(), 0.0)
-
-    return elapsed
-
-
 def get_last_valid_step(sequence, mask=None):
     """
     Gather the last non-padded timestep for each sequence in the batch.
@@ -78,6 +57,30 @@ def get_last_valid_step(sequence, mask=None):
     last_indices = lengths - 1
     batch_indices = torch.arange(sequence.size(0), device=sequence.device)
     return sequence[batch_indices, last_indices]
+
+
+def build_elapsed_times(timesteps, mask=None):
+    """
+    Build elapsed times aligned to each timestep.
+
+    The first valid timestep has elapsed time 0. Subsequent valid timesteps get
+    the gap from the previous timestep. Padded positions are zeroed.
+    """
+    if timesteps.dim() != 2:
+        raise ValueError(f"timesteps must have shape (B, T), got {timesteps.shape}")
+
+    elapsed = torch.zeros_like(timesteps, dtype=torch.float32)
+    if timesteps.size(1) > 1:
+        elapsed[:, 1:] = timesteps[:, 1:].float() - timesteps[:, :-1].float()
+
+    elapsed = torch.nan_to_num(elapsed, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
+
+    if mask is not None:
+        if mask.shape != timesteps.shape:
+            raise ValueError(f"mask shape {mask.shape} does not match timesteps shape {timesteps.shape}")
+        elapsed = elapsed.masked_fill(~mask.bool(), 0.0)
+
+    return elapsed
 
 
 def masked_mean_over_time(sequence, mask):
@@ -164,10 +167,200 @@ def compute_mutual_information(X, y):
     """
     return mutual_info_regression(X, y)
 
-def compute_mig(representations, factors, group_size=3, overlap=1):
+def _infer_is_categorical(n_factors):
     """
-    Compute MIG score using overlapping groups of dimensions.
-    
+    Factors are assembled as static categorical, then static numerical, then
+    time-series, so the leading len(static_categorical_cols) are categorical.
+    """
+    n_cat = len(CONFIG['static_categorical_cols'])
+    if n_factors >= n_cat:
+        return [True] * n_cat + [False] * (n_factors - n_cat)
+    return [False] * n_factors
+
+
+def _discretize(x, bins=20):
+    edges = np.histogram_bin_edges(x, bins=bins)
+    return np.digitize(x, edges[1:-1])
+
+
+def _entropy(codes):
+    _, counts = np.unique(codes, return_counts=True)
+    p = counts / counts.sum()
+    return float(-(p * np.log(p + 1e-12)).sum())
+
+
+def _eta_squared(z, codes):
+    """Correlation ratio: between-group variance over total variance."""
+    total_var = z.var()
+    if total_var <= 1e-12:
+        return 0.0
+    grand = z.mean()
+    num = 0.0
+    for c in np.unique(codes):
+        g = z[codes == c]
+        if g.size:
+            num += g.size * (g.mean() - grand) ** 2
+    return float(num / (z.size * total_var))
+
+
+def compute_mig(representations, factors, is_cat=None, bins=20):
+    """
+    MIG (Chen et al. 2018): for each factor, the normalised gap between the
+    highest and second-highest mutual information across single latent
+    dimensions, averaged over factors.
+
+    The gap is the point: a disentangled representation should carry a factor
+    in one dimension, not spread across many.
+    """
+    from sklearn.metrics import mutual_info_score
+
+    Z = np.asarray(representations)
+    F = np.asarray(factors)
+    if is_cat is None:
+        is_cat = _infer_is_categorical(F.shape[1])
+
+    Zd = np.stack([_discretize(Z[:, j], bins) for j in range(Z.shape[1])], axis=1)
+    per_factor = []
+    for k in range(F.shape[1]):
+        fk = F[:, k].astype(int) if is_cat[k] else _discretize(F[:, k], bins)
+        H = _entropy(fk)
+        if H <= 1e-8:
+            continue
+        mi = np.array([mutual_info_score(Zd[:, j], fk) for j in range(Z.shape[1])])
+        top = np.sort(mi)[::-1]
+        per_factor.append((top[0] - top[1]) / H)
+    if not per_factor:
+        return float('nan'), np.array([])
+    return float(np.mean(per_factor)), np.array(per_factor)
+
+
+def compute_sap(representations, factors, is_cat=None):
+    """
+    SAP (Kumar et al. 2018): for each factor, the gap between the best and
+    second-best SINGLE latent dimension at predicting it, averaged over factors.
+
+    Numerical factors are scored by the R^2 of a one-predictor regression
+    (equivalently the squared correlation); categorical factors by the
+    correlation ratio eta^2, its categorical analogue.
+    """
+    Z = np.asarray(representations)
+    F = np.asarray(factors)
+    if is_cat is None:
+        is_cat = _infer_is_categorical(F.shape[1])
+
+    Zc = Z - Z.mean(axis=0, keepdims=True)
+    Zs = Zc.std(axis=0) + 1e-12
+    per_factor = []
+    for k in range(F.shape[1]):
+        if is_cat[k]:
+            codes = F[:, k].astype(int)
+            scores = np.array([_eta_squared(Z[:, j], codes) for j in range(Z.shape[1])])
+        else:
+            f = F[:, k] - F[:, k].mean()
+            corr = (Zc * f[:, None]).mean(axis=0) / (Zs * (f.std() + 1e-12))
+            scores = corr ** 2
+        top = np.sort(scores)[::-1]
+        per_factor.append(float(top[0] - top[1]))
+    if not per_factor:
+        return float('nan'), np.array([])
+    return float(np.mean(per_factor)), np.array(per_factor)
+
+
+def compute_dci(representations, factors, is_cat=None, n_estimators=50, max_depth=10,
+                random_state=42, test_size=0.2):
+    """
+    DCI (Eastwood & Williams 2018): Disentanglement, Completeness, Informativeness.
+
+    Built from an importance matrix R, where R[j, i] is the importance of latent
+    dimension i for predicting factor j, taken from random-forest feature
+    importances.
+
+      D = sum_i rho_i * (1 - H_{n_factors}(P_i)),  P_i = R[:, i] / sum_j R[j, i]
+      C = mean_j (1 - H_{n_latents}(P~_j)),        P~_j = R[j, :] / sum_i R[j, i]
+      I = mean_j R^2 (or accuracy) of predicting factor j from all latents
+
+    D asks whether each dimension captures one factor; C asks whether each
+    factor is captured by one dimension. Both are gaps in disguise, which is
+    what makes them meaningful where compute_sap_lenient is not.
+
+    This mirrors the implementation in notebooks/interpret.ipynb, with one
+    correction: categorical factors are handled with a classifier rather than a
+    regressor on the raw label codes.
+    """
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    from sklearn.model_selection import train_test_split
+
+    Z = np.asarray(representations)
+    F = np.asarray(factors)
+    if is_cat is None:
+        is_cat = _infer_is_categorical(F.shape[1])
+
+    n_factors, n_latents = F.shape[1], Z.shape[1]
+    R = np.zeros((n_factors, n_latents))
+    scores = []
+
+    for j in range(n_factors):
+        y = F[:, j]
+        if is_cat[j]:
+            y = y.astype(int)
+            if len(np.unique(y)) < 2:
+                continue
+            model = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth,
+                                           random_state=random_state)
+        else:
+            model = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth,
+                                          random_state=random_state)
+        try:
+            Xtr, Xte, ytr, yte = train_test_split(Z, y, test_size=test_size,
+                                                  random_state=random_state)
+        except ValueError:
+            continue
+        model.fit(Xtr, ytr)
+        R[j] = model.feature_importances_
+        scores.append(float(model.score(Xte, yte)))
+
+    total = R.sum()
+    if total <= 0:
+        return {'disentanglement': float('nan'), 'completeness': float('nan'),
+                'informativeness': float('nan')}
+
+    # Disentanglement: per-dimension importance entropy, weighted by dimension use
+    rho = R.sum(axis=0) / total
+    D_i = np.zeros(n_latents)
+    for i in range(n_latents):
+        col = R[:, i]
+        s = col.sum()
+        if s <= 0:
+            continue
+        p = col / s
+        H = -(p * np.log(p + 1e-10)).sum() / np.log(n_factors)
+        D_i[i] = 1.0 - H
+    D = float((rho * D_i).sum())
+
+    # Completeness: per-factor importance entropy across dimensions
+    C_j = []
+    for j in range(n_factors):
+        row = R[j]
+        s = row.sum()
+        if s <= 0:
+            continue
+        p = row / s
+        H = -(p * np.log(p + 1e-10)).sum() / np.log(n_latents)
+        C_j.append(1.0 - H)
+    C = float(np.mean(C_j)) if C_j else float('nan')
+
+    I = float(np.mean(scores)) if scores else float('nan')
+    return {'disentanglement': D, 'completeness': C, 'informativeness': I}
+
+
+def compute_mig_lenient(representations, factors, group_size=3, overlap=1):
+    """
+    DEPRECATED -- kept only to reproduce previously published numbers.
+
+    Scores overlapping GROUPS of dimensions rather than the standard top-1 vs
+    top-2 single-dimension gap, which makes it substantially more permissive.
+    Use compute_mig for the standard definition.
+
     Args:
         representations: numpy array of shape (n_samples, n_latent_dims)
         factors: numpy array of shape (n_samples, n_factors)
@@ -219,14 +412,20 @@ def compute_mig(representations, factors, group_size=3, overlap=1):
     mig_score = np.mean(factor_mig_scores)
     return mig_score, np.array(factor_mig_scores)
 
-def compute_sap(representations, factors, top_k=5, threshold=0.1):
+def compute_sap_lenient(representations, factors, top_k=5, threshold=0.1):
     """
-    More lenient SAP calculation that's easier for models to achieve good scores.
-    
-    Changes:
-    1. Uses absolute R² values instead of gaps
-    2. Applies softer thresholding
-    3. More generous normalization
+    DEPRECATED -- kept only to reproduce previously published numbers.
+
+    This does NOT measure disentanglement. It reports the absolute R^2 of the
+    best top_k dimensions fitted jointly, i.e. how PREDICTABLE a factor is,
+    rather than the standard best-vs-second-best gap, which is what separation
+    means. A fully entangled representation, where every dimension encodes
+    every factor, scores high here. Use compute_sap instead.
+
+    Original note from the authors:
+    "More lenient SAP calculation that's easier for models to achieve good
+    scores. 1. Uses absolute R² values instead of gaps 2. Applies softer
+    thresholding 3. More generous normalization"
     """
     n_samples, n_latent = representations.shape
     n_factors = factors.shape[1]
@@ -263,30 +462,46 @@ def compute_sap(representations, factors, top_k=5, threshold=0.1):
     sap_score = np.mean(factor_sap_scores)
     return sap_score, np.array(factor_sap_scores)
 
-def correlation_loss(z):
+def correlation_loss(z, reduction='sum'):
     """
-    Computes decorrelation loss on hidden states.
+    L_decorr (paper Eq. 8): penalise off-diagonal covariance of the embedding.
+
+        L_decorr = sum_{i != j} Cov(Z)_{i,j}^2
 
     Args:
-        z (torch.Tensor): Hidden state representations of shape (B, D).
+        z: representations of shape (N, D).
+        reduction: how the D(D-1) off-diagonal terms are aggregated.
+            'sum'  -- Eq. 8 exactly as printed.
+            'dim'  -- divided by D.
+            'mean' -- divided by D(D-1).
 
-    Returns:
-        torch.Tensor: Scalar decorrelation loss value.
+    Note on scale: with D = 512 the sum runs over 261,632 terms, so 'sum' is
+    orders of magnitude larger than L_recon and, at the paper's lambda_decorr
+    of 0.4, dominates the objective. The reduction is therefore exposed rather
+    than fixed, since Eq. 8 does not say which one produced the reported
+    results. See docs/paper_alignment.md.
     """
-    B, D = z.shape
-    if B < 2:
+    N, D = z.shape
+    if N < 2:
         return torch.zeros((), device=z.device, dtype=z.dtype)
 
     # Normalize to zero mean
     z = z - z.mean(dim=0, keepdim=True)
 
     # Compute covariance matrix
-    cov_matrix = (z.T @ z) / (B - 1)
+    cov_matrix = (z.T @ z) / (N - 1)
 
     # Remove diagonal (force decorrelation)
     off_diag = cov_matrix - torch.diag(torch.diag(cov_matrix))
+    total = (off_diag ** 2).sum()
 
-    return (off_diag ** 2).sum()  # Minimize off-diagonal values
+    if reduction == 'sum':
+        return total
+    if reduction == 'dim':
+        return total / D
+    if reduction == 'mean':
+        return total / (D * (D - 1))
+    raise ValueError(f"unknown reduction: {reduction}")
 
 def balanced_correlation_loss(z, beta=0.5):
     """
@@ -329,29 +544,51 @@ def balanced_correlation_loss(z, beta=0.5):
 
 
 class FeatureDecoders(nn.Module):
-    def __init__(self, hidden_dim, config):
+    """
+    Per-factor decoders behind L_disent (paper Eq. 9).
+
+    Each generative factor f_d gets its own sparse soft mask M_d over the Nexus
+    dimensions and its own small decoder, so that predicting f_d can only draw
+    on the dimensions its mask selects. The L1 penalty on the masks is what
+    pushes different factors onto different dimensions.
+    """
+
+    def __init__(self, hidden_dim, config, categorical_cardinalities=None):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.num_masks = len(config['static_categorical_cols']) + \
                         len(config['static_numerical_cols']) + \
                         len(config['ts_features'])
-        
+
         self.dimension_masks = nn.Parameter(
             torch.randn(self.num_masks, hidden_dim),
             requires_grad=True
         )
-        
-        # Modify decoders to output correct shapes
+
+        # Categorical factors are multi-class (blood group, underlying disease,
+        # type of donation, ...), so each decoder emits one logit per class and
+        # is scored with cross-entropy. Scoring them against the raw integer
+        # label -- as a single logit would require -- would impose a spurious
+        # ordinal structure on unordered categories.
+        if categorical_cardinalities is None:
+            raise ValueError(
+                "categorical_cardinalities is required so categorical factors can be "
+                "decoded as multi-class targets"
+            )
+        if len(categorical_cardinalities) != len(config['static_categorical_cols']):
+            raise ValueError("Length of categorical_cardinalities does not match number of categorical columns.")
+
+        self.categorical_cardinalities = list(categorical_cardinalities)
         self.cat_decoders = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, 32),
                 nn.ReLU(),
-                nn.Linear(32, 1)  # Output single logit per feature
+                nn.Linear(32, int(cardinality))
             )
-            for _ in config['static_categorical_cols']
+            for cardinality in self.categorical_cardinalities
         ])
-        
+
         self.num_decoders = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, 32),
@@ -401,27 +638,115 @@ class FeatureDecoders(nn.Module):
         
         return predictions, masks
 
-def feature_prediction_loss(predictions, masks, cat_features, num_features, ts_features):
-    loss = 0
-    criterion_bce = nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss for binary features
+def feature_prediction_loss(predictions, masks, cat_features, num_features, ts_features, alpha=None):
+    """
+    L_disent (paper Eq. 9): mean factor-prediction error plus an L1 penalty on
+    the soft masks.
+
+        L_disent = (1/D) sum_d (f_d - f_hat_d(Z))^2 + alpha * ||M_d||_1
+
+    Categorical factors use cross-entropy rather than squared error; see the
+    note in FeatureDecoders.
+    """
+    if alpha is None:
+        alpha = CONFIG['alpha_disent']
+
     criterion_num = nn.MSELoss()
-    
-    # Categorical feature losses
+
+    loss = 0.0
+    num_factors = 0
+
+    # Categorical factors (multi-class cross-entropy)
     for i, pred in enumerate(predictions['categorical']):
-        target = cat_features[:, i].float().unsqueeze(1)  # (B, 1)
-        loss += criterion_bce(pred, target)
-    
-    # Numerical feature losses
+        target = cat_features[:, i].long()
+        loss = loss + F.cross_entropy(pred, target)
+        num_factors += 1
+
+    # Numerical static factors
     for i, pred in enumerate(predictions['numerical']):
         target = num_features[:, i].unsqueeze(1)  # (B, 1)
-        loss += criterion_num(pred, target)
-    
-    # Time series feature losses
+        loss = loss + criterion_num(pred, target)
+        num_factors += 1
+
+    # Time series factors
     for i, pred in enumerate(predictions['ts']):
         target = ts_features[:, i].unsqueeze(1)  # (B, 1)
-        loss += criterion_num(pred, target)
-    
-    # Add sparsity loss on masks
+        loss = loss + criterion_num(pred, target)
+        num_factors += 1
+
+    loss = loss / max(num_factors, 1)
+
+    # L1 sparsity on the soft masks
     sparsity_loss = torch.mean(torch.sum(masks, dim=1) / masks.shape[1])
-    
-    return loss + 0.1 * sparsity_loss
+
+    return loss + alpha * sparsity_loss
+
+
+def build_future_windows(timesteps, ts_values, value_mask, step_mask, horizon):
+    """
+    Gather the next `horizon` observations after every query timestep.
+
+    Returns:
+        future_elapsed: (B, T, H) gap between each future step and the one before
+            it (the first is measured from the query timestep itself).
+        future_values: (B, T, H, F) target values.
+        target_mask: (B, T, H, F) 1 where the target is a real, observed value
+            that also falls inside a valid (non-padded) timestep.
+    """
+    B, T, n_features = ts_values.shape
+    H = horizon
+    dev = ts_values.device
+
+    future_values = ts_values.new_zeros(B, T, H, n_features)
+    future_obs = value_mask.new_zeros(B, T, H, n_features)
+    future_times = timesteps.new_zeros(B, T, H)
+    future_step_valid = torch.zeros(B, T, H, dtype=torch.bool, device=dev)
+
+    for h in range(1, H + 1):
+        if h >= T:
+            break
+        future_values[:, :T - h, h - 1] = ts_values[:, h:]
+        future_obs[:, :T - h, h - 1] = value_mask[:, h:]
+        future_times[:, :T - h, h - 1] = timesteps[:, h:]
+        if step_mask is not None:
+            future_step_valid[:, :T - h, h - 1] = step_mask[:, h:].bool()
+        else:
+            future_step_valid[:, :T - h, h - 1] = True
+
+    # Gaps between consecutive future observation times.
+    prev_times = torch.cat([timesteps.unsqueeze(-1), future_times[:, :, :-1]], dim=-1)
+    future_elapsed = (future_times - prev_times).to(dtype=ts_values.dtype)
+    future_elapsed = torch.nan_to_num(future_elapsed, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
+    future_elapsed = future_elapsed.masked_fill(~future_step_valid, 0.0)
+
+    target_mask = future_obs.to(dtype=ts_values.dtype) * future_step_valid.unsqueeze(-1).to(dtype=ts_values.dtype)
+    if step_mask is not None:
+        # Only decode from query timesteps that are themselves real.
+        target_mask = target_mask * step_mask.bool().view(B, T, 1, 1).to(dtype=ts_values.dtype)
+
+    return future_elapsed, future_values, target_mask
+
+
+def multistep_reconstruction_loss(predictions, targets, target_mask):
+    """
+    L_recon (paper Eq. 7): mean squared error over the H predicted steps,
+    averaged over observed target entries only.
+
+    predictions / targets / target_mask: (B, T, H, F)
+    """
+    squared_error = (predictions - targets) ** 2
+    masked = squared_error * target_mask
+    denom = target_mask.sum()
+    if denom.item() == 0:
+        return torch.zeros((), device=predictions.device, dtype=predictions.dtype)
+    return masked.sum() / denom
+
+
+def flatten_valid_timesteps(sequence, step_mask):
+    """
+    Collapse (B, T, D) to (N, D) keeping only real timesteps. Used to apply the
+    decorrelation loss across the Nexus embedding rather than a single timestep.
+    """
+    if step_mask is None:
+        return sequence.reshape(-1, sequence.shape[-1])
+    return sequence[step_mask.bool()]

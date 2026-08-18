@@ -3,7 +3,7 @@ import numpy as np
 import os
 import json
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -532,6 +532,10 @@ def split_patient_ids(patient_ids: Sequence, train_size: float = 0.8, val_size: 
     }
 
 
+# Persisted-split helper from the main branch. Kept alongside the
+# patient_split_ids argument of create_dataset_splits: the notebooks use this
+# to pin one split across runs, while the training/evaluation scripts pass
+# splits in explicitly. The two are complementary, not alternatives.
 def get_or_create_global_split(
     patient_ids: Sequence,
     split_json_path: str,
@@ -637,19 +641,11 @@ def create_dataset_splits(
     shuffle: bool = True,
     max_patients: Optional[int] = None,
     patient_ids: Optional[Sequence] = None,
+    patient_split_ids: Optional[Mapping[str, Sequence]] = None,
+    preprocessing_artifacts: Optional[PreprocessingArtifacts] = None,
     min_ts_count: int = 10,
     require_notes: bool = True,
-    skip_split: bool = False,
 ) -> dict[str, object]:
-    """
-    Create train/val/test dataset splits with optional patient filtering.
-    
-    Args:
-        patient_ids: If provided, filter to only these patient IDs.
-                    Use for pool-based training (e.g., backbone on pool_a, adapter on pool_b).
-        skip_split: If True, returns all filtered patients as 'train' dataset (no 80/20 split).
-                   Use when training adapters on pool_b or evaluating on pool_c.
-    """
     eligible_patient_ids = get_valid_patient_ids(
         static_df=static_df,
         ts_data=ts_data,
@@ -659,25 +655,32 @@ def create_dataset_splits(
     )
 
     if patient_ids is not None:
-        allowed_patient_ids = set(patient_ids)
-        eligible_patient_ids = np.asarray([pid for pid in eligible_patient_ids if pid in allowed_patient_ids])
+        eligible_patient_id_set = set(eligible_patient_ids)
+        eligible_patient_ids = np.asarray([pid for pid in patient_ids if pid in eligible_patient_id_set])
 
-    if max_patients is not None and len(eligible_patient_ids) > max_patients:
+    if patient_split_ids is not None:
+        eligible_patient_id_set = set(eligible_patient_ids)
+        selected_patient_ids = patient_split_ids.get('selected', eligible_patient_ids)
+        eligible_patient_ids = np.asarray([pid for pid in selected_patient_ids if pid in eligible_patient_id_set])
+        split_ids = {
+            split_name: np.asarray([pid for pid in patient_split_ids.get(split_name, []) if pid in eligible_patient_id_set])
+            for split_name in ('train', 'val', 'test')
+        }
+    elif max_patients is not None and len(eligible_patient_ids) > max_patients:
         if shuffle:
             rng = np.random.default_rng(random_state)
             eligible_patient_ids = eligible_patient_ids.copy()
             rng.shuffle(eligible_patient_ids)
         eligible_patient_ids = eligible_patient_ids[:max_patients]
-
-    if skip_split:
-        # For pool assignment workflows: return all patients as 'train', no split
-        split_ids = {
-            'train': eligible_patient_ids,
-            'val': np.array([], dtype=eligible_patient_ids.dtype),
-            'test': np.array([], dtype=eligible_patient_ids.dtype),
-        }
+        split_ids = split_patient_ids(
+            patient_ids=eligible_patient_ids,
+            train_size=train_size,
+            val_size=val_size,
+            test_size=test_size,
+            random_state=random_state,
+            shuffle=shuffle,
+        )
     else:
-        # Standard 80/20 train/test split (or 80/10/10 with val)
         split_ids = split_patient_ids(
             patient_ids=eligible_patient_ids,
             train_size=train_size,
@@ -687,17 +690,21 @@ def create_dataset_splits(
             shuffle=shuffle,
         )
 
+    fit_preprocessing = preprocessing_artifacts is None
+
     train_dataset = NephroCAGEDataset(
         static_df=static_df,
         ts_data=ts_data,
         notes_df=notes_df,
         biopsy_df=biopsy_df,
         patient_ids=split_ids['train'],
-        fit_preprocessing=True,
+        preprocessing_artifacts=preprocessing_artifacts,
+        fit_preprocessing=fit_preprocessing,
         min_ts_count=min_ts_count,
         require_notes=require_notes,
     )
-    preprocessing_artifacts = train_dataset.preprocessing_artifacts
+    if preprocessing_artifacts is None:
+        preprocessing_artifacts = train_dataset.preprocessing_artifacts
 
     val_dataset = None
     if len(split_ids['val']) > 0:
@@ -794,8 +801,8 @@ class NephroCAGEDataset(Dataset):
         )
 
         if patient_ids is not None:
-            selected_patient_ids = set(patient_ids)
-            valid_patient_ids = np.asarray([pid for pid in valid_patient_ids if pid in selected_patient_ids])
+            valid_patient_id_set = set(valid_patient_ids)
+            valid_patient_ids = np.asarray([pid for pid in patient_ids if pid in valid_patient_id_set])
 
         # Filter self.static_df, self.labels, and self.ts_data to include only valid_patient_ids
         self.static_df = self.static_df[self.static_df['patient_id'].isin(valid_patient_ids)].copy()
@@ -815,8 +822,8 @@ class NephroCAGEDataset(Dataset):
         self.scaler = self.preprocessing_artifacts.static_scaler
         self.ts_scaler = self.preprocessing_artifacts.ts_scaler
 
-        # Get unique patient_ids
-        self.patient_ids = self.static_df['patient_id'].unique().astype(int)
+        # Preserve the explicit split order so dataloader row indices are stable.
+        self.patient_ids = np.asarray(valid_patient_ids).astype(int)
         if len(self.patient_ids) != len(self.static_df):
             raise ValueError("Duplicate patients in static df")
 
