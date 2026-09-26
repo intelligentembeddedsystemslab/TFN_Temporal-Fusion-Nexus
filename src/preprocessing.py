@@ -252,6 +252,16 @@ def create_vitals_df(dfs):
     vitals_ca['rel_days'] = vitals_ca['rel_days'].astype(str).str.replace(',', '.').astype(float).astype(int)
     vitals_lab['rel_days'] = vitals_lab['rel_days'].astype(str).str.replace(',', '.').astype(float).astype(int)
 
+    # Collapse repeated same-day assessments to one row per day. The copies are
+    # complementary (one row has weight, the other bp), so drop_duplicates would
+    # lose data; mean() skips NaN, keeping the non-null value where only one row
+    # observes a feature and averaging genuine repeat measurements. Done here,
+    # before create_ts_data, so labs and medications are not broadcast onto
+    # every copy by the merges.
+    n_before = len(vitals_ca)
+    vitals_ca = vitals_ca.groupby(['patient_id', 'transplant_id', 'rel_days'], as_index=False, dropna=False)[features_to_clean].mean()
+    print(f"Collapsed {n_before - len(vitals_ca)} duplicate same-day clinical assessment rows")
+
     return vitals_ca, vitals_lab
 
 
