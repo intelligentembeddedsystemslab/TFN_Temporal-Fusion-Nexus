@@ -2,6 +2,15 @@
 
 Summary: Multimodal modeling for kidney transplant patients on the NephroCAGE cohort. The code fuses irregular time-series vitals, static donor/recipient attributes, and free-text clinical notes into a shared embedding (the "Nexus"), which downstream heads use to predict graft loss, rejection, and mortality across multiple horizons.
 
+Preprint: https://arxiv.org/abs/2601.08503
+Cite: 
+@article{kumar2026temporal,
+  title={Temporal Fusion Nexus: A task-agnostic multi-modal embedding model for clinical narratives and irregular time series in post-kidney transplant care},
+  author={Kumar, Aditya and Rauch, Simon and Cypko, Mario and Naik, Marcel and Schapranow, Matthieu-P and Rashid, Aadil and Halleck, Fabian and Osmanodja, Bilgin and Roller, Roland and Pape, Lars and others},
+  journal={arXiv preprint arXiv:2601.08503},
+  year={2026}
+}
+
 ## Repository Map
 
 Library code (`src/`):
